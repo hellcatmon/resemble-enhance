@@ -13,6 +13,15 @@ from .hparams import HParams
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_removed_parametrizations(module):
+    """Clean up removed parametrizations to prevent memory leaks"""
+    for name, submodule in module.named_modules():
+        if hasattr(submodule, '_parametrizations'):
+            submodule._parametrizations = {}
+        if hasattr(submodule, '_original_parametrizations'):
+            submodule._original_parametrizations = {}
+
+
 @torch.inference_mode()
 def inference_chunk(model, dwav, sr, device, npad=441):
     assert model.hp.wav_rate == sr, f"Expected {model.hp.wav_rate} Hz, got {sr} Hz"
@@ -118,6 +127,8 @@ def remove_weight_norm_recursively(module):
             remove_parametrizations(module, "weight")
         except Exception:
             pass
+    # Clean up removed parametrizations
+    _cleanup_removed_parametrizations(module)
 
 
 def inference(model, dwav, sr, device, chunk_seconds: float = 30.0, overlap_seconds: float = 1.0):
@@ -141,6 +152,8 @@ def inference(model, dwav, sr, device, chunk_seconds: float = 30.0, overlap_seco
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+        # Clear CUDA cache
+        torch.cuda.empty_cache()
 
     start_time = time.perf_counter()
 
@@ -156,6 +169,8 @@ def inference(model, dwav, sr, device, chunk_seconds: float = 30.0, overlap_seco
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+        # Clear CUDA cache again
+        torch.cuda.empty_cache()
 
     elapsed_time = time.perf_counter() - start_time
     logger.info(f"Elapsed time: {elapsed_time:.3f} s, {hwav.shape[-1] / elapsed_time / 1000:.3f} kHz")
