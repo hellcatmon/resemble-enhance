@@ -88,8 +88,7 @@ def main():
         random.shuffle(paths)
 
     if len(paths) == 0:
-        print(f"No {args.suffix} files found in the following path: {
-              args.in_dir}")
+        print(f"No {args.suffix} files found in the following path: {args.in_dir}")
         return
 
     pbar = tqdm(paths)
