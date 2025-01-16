@@ -10,6 +10,8 @@ import os
 
 from .inference import denoise, enhance
 
+# Move process_files outside of main for proper serialization
+
 
 def process_files(rank, world_size, args, file_paths):
     # Set device for this process
@@ -67,7 +69,6 @@ def process_files(rank, world_size, args, file_paths):
             raise e
 
 
-@torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -132,7 +133,6 @@ def main():
 
     start_time = time.perf_counter()
 
-    # Get all file paths
     paths = sorted(args.in_dir.glob(f"**/*{args.suffix}"))
     if args.parallel_mode:
         random.shuffle(paths)
@@ -142,13 +142,22 @@ def main():
         return
 
     if num_gpus > 1:
-        # Multiprocessing for multiple GPUs
-        mp.spawn(
-            process_files,
-            args=(num_gpus, args, paths),
-            nprocs=num_gpus,
-            join=True
-        )
+        # Use spawn method for Windows compatibility
+        mp.set_start_method('spawn', force=True)
+
+        # Start multiprocessing pool
+        processes = []
+        for rank in range(num_gpus):
+            p = mp.Process(
+                target=process_files,
+                args=(rank, num_gpus, args, paths)
+            )
+            p.start()
+            processes.append(p)
+
+        # Wait for all processes to complete
+        for p in processes:
+            p.join()
     else:
         # Single GPU/CPU processing
         process_files(0, 1, args, paths)
@@ -158,6 +167,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Required for Windows support
-    mp.set_start_method('spawn', force=True)
     main()
