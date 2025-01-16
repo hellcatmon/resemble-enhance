@@ -1,13 +1,70 @@
 import argparse
 import random
 import time
+import torch.multiprocessing as mp
 from pathlib import Path
-
 import torch
 import torchaudio
 from tqdm import tqdm
+import os
 
 from .inference import denoise, enhance
+
+
+def process_files(rank, world_size, args, file_paths):
+    # Set device for this process
+    device = f'cuda:{rank}'
+    torch.cuda.set_device(device)
+
+    # Calculate chunk of files for this GPU
+    chunk_size = len(file_paths) // world_size
+    start_idx = rank * chunk_size
+    end_idx = start_idx + chunk_size if rank < world_size - \
+        1 else len(file_paths)
+    gpu_files = file_paths[start_idx:end_idx]
+
+    pbar = tqdm(gpu_files, position=rank, desc=f'GPU {rank}')
+
+    for path in pbar:
+        out_path = args.out_dir / path.relative_to(args.in_dir)
+        if args.parallel_mode and out_path.exists():
+            continue
+
+        try:
+            dwav, sr = torchaudio.load(path)
+            dwav = dwav.mean(0)
+
+            if args.denoise_only:
+                hwav, sr = denoise(
+                    dwav=dwav,
+                    sr=sr,
+                    device=device,
+                    run_dir=args.run_dir,
+                )
+            else:
+                hwav, sr = enhance(
+                    dwav=dwav,
+                    sr=sr,
+                    device=device,
+                    nfe=args.nfe,
+                    solver=args.solver,
+                    lambd=args.lambd,
+                    tau=args.tau,
+                    run_dir=args.run_dir,
+                )
+
+            del dwav
+            torch.cuda.empty_cache()
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            torchaudio.save(out_path, hwav[None], sr)
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\nGPU {rank}: Skipping {path} - file too large for available memory")
+                torch.cuda.empty_cache()
+                continue
+            raise e
 
 
 @torch.inference_mode()
@@ -27,12 +84,6 @@ def main():
         type=str,
         default=".wav",
         help="Audio file suffix",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device to use for computation, recommended to use CUDA",
     )
     parser.add_argument(
         "--denoise_only",
@@ -72,18 +123,17 @@ def main():
 
     args = parser.parse_args()
 
-    device = args.device
-
-    if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA is not available but --device is set to cuda, using CPU instead")
+    # Get number of available GPUs
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        print("No CUDA devices available, running on CPU")
         device = "cpu"
+        num_gpus = 1
 
     start_time = time.perf_counter()
 
-    run_dir = args.run_dir
-
+    # Get all file paths
     paths = sorted(args.in_dir.glob(f"**/*{args.suffix}"))
-
     if args.parallel_mode:
         random.shuffle(paths)
 
@@ -91,61 +141,23 @@ def main():
         print(f"No {args.suffix} files found in the following path: {args.in_dir}")
         return
 
-    pbar = tqdm(paths)
+    if num_gpus > 1:
+        # Multiprocessing for multiple GPUs
+        mp.spawn(
+            process_files,
+            args=(num_gpus, args, paths),
+            nprocs=num_gpus,
+            join=True
+        )
+    else:
+        # Single GPU/CPU processing
+        process_files(0, 1, args, paths)
 
-    # Add periodic memory cleanup without model reloading
-    for i, path in enumerate(pbar):
-        if i > 0 and i % 10 == 0:  # Every 10 files
-            torch.cuda.empty_cache()  # Clear unused memory
-
-        out_path = args.out_dir / path.relative_to(args.in_dir)
-        if args.parallel_mode and out_path.exists():
-            continue
-
-        pbar.set_description(f"Processing {out_path}")
-
-        # Process in smaller chunks if file is large
-        try:
-            dwav, sr = torchaudio.load(path)
-            dwav = dwav.mean(0)
-
-            if args.denoise_only:
-                hwav, sr = denoise(
-                    dwav=dwav,
-                    sr=sr,
-                    device=device,
-                    run_dir=args.run_dir,
-                )
-            else:
-                hwav, sr = enhance(
-                    dwav=dwav,
-                    sr=sr,
-                    device=device,
-                    nfe=args.nfe,
-                    solver=args.solver,
-                    lambd=args.lambd,
-                    tau=args.tau,
-                    run_dir=run_dir,
-                )
-
-            # Explicitly clear intermediate tensors
-            del dwav
-            torch.cuda.empty_cache()
-
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            torchaudio.save(out_path, hwav[None], sr)
-
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                print(f"\nSkipping {path} - file too large for available memory")
-                torch.cuda.empty_cache()
-                continue
-            raise e
-
-    # Cool emoji effect saying the job is done
     elapsed_time = time.perf_counter() - start_time
     print(f"🌟 Enhancement done! {len(paths)} files processed in {elapsed_time:.2f}s")
 
 
 if __name__ == "__main__":
+    # Required for Windows support
+    mp.set_start_method('spawn', force=True)
     main()
