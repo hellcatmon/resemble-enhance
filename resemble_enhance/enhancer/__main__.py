@@ -137,8 +137,7 @@ def main():
 
         except RuntimeError as e:
             if "out of memory" in str(e):
-                print(f"\nSkipping {
-                      path} - file too large for available memory")
+                print(f"\nSkipping {path} - file too large for available memory")
                 torch.cuda.empty_cache()
                 continue
             raise e
